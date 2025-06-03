@@ -27,32 +27,5 @@ def generate_password2(length: int = 12):
     password = ''.join(random.choice(alphabet) for i in range(length))
     return password
 
-def password_strength(password: str):
-    """Check the strength of a password."""
-    if len(password) < 10:
-        print("Weak: Password must be at least 8 characters long.")
-        return False
-    
-    if not any(char.isdigit() for char in password):
-        print("Weak: Password must contain at least one digit.")
-        return False
-    
-    if not any(char.isupper() for char in password):
-        print("Weak: Password must contain at least one uppercase letter.")
-        return False
-    
-    if not any(char.islower() for char in password):
-        print("Weak: Password must contain at least one lowercase letter.")
-        return False
-    
-    if not any(char in string.punctuation for char in password):
-        print("Weak: Password must contain at least one special character.")
-        return False
 
-    return True
-
-# pwd = generate_password(12, True, True, True)
-# print(pwd)
-# pwd2 = generate_password2(12)
-# print(pwd2)
 
