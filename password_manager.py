@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+from argon2 import PasswordHasher, exceptions as argon2_exceptions
 import sqlite3
 import string
 import time
@@ -7,8 +9,77 @@ import password_generator
 import os
 import sys
 
+ # Load environment variables from .env file
+load_dotenv() 
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 DB_PATH = r"vault.db"
+
+ph = PasswordHasher(
+    time_cost=4,  # Number of iterations
+    memory_cost=2**16,  # Memory cost in KB
+    parallelism=8,  # Number of threads
+)
+
+def get_pepper() -> bytes:
+    """Retrieve the pepper from environment variables."""
+    pepper_hex = os.environ.get("PASSWORD_MANAGER_PEPPER")
+    if not pepper_hex:
+        print("ERROR: PASSWORD_MANAGER_PEPPER environment variable not set.")
+        print("Please create a .env file with PASSWORD_MANAGER_PEPPER=<64-hex>.")
+    try:
+        return bytes.fromhex(pepper_hex)
+    except ValueError:
+        print("ERROR: PASSWORD_MANAGER_PEPPER must be a valid 64-character hex string.")
+        exit(1)
+
+def hash_password_with_argon2(plain_password: str) -> str:
+    """Hash a password string using a salt, pepper, and Argon2"""
+    # Create per user salt
+    user_salt = os.urandom(16)
+    salt_hex = user_salt.hex()
+
+    # Get pepper from environment variable
+    pepper = get_pepper()
+
+    # Combine salt, pepper, and password
+    combined = user_salt + pepper + plain_password.encode('utf-8')
+
+    # Hash the combined value using Argon2
+    argon2_encoded = ph.hash(combined)
+
+    # Return the salt and the Argon2 hash
+    return f"{salt_hex}${argon2_encoded}"
+
+def verify_password_with_argon2(stored_pw_hash: str, password_attempt: str) -> bool:
+    """
+    1. Split stored_pw_hash at the first "$" into:
+       salt_hex (32 chars)  and  argon2_encoded (the rest).
+    2. Convert salt_hex back to bytes.
+    3. Reassemble: salt_bytes ∥ pepper_bytes ∥ attempt_password_bytes.
+    4. ph.verify(argon2_encoded, combined_attempt).  
+       If it matches, return True; otherwise return False.
+    """
+
+    try:
+        salt_hex, argon2_encoded = stored_pw_hash.split('$', 1)
+    except ValueError:
+        # Malformed entry, no "$" found, treat as invalid
+        return False    
+    
+    user_salt = bytes.fromhex(salt_hex) # Convert hex to bytes
+    pepper =get_pepper() # Get pepper from environment variable
+    attempt_input = user_salt + pepper + password_attempt.encode('utf-8')
+
+    try:
+        # Verify the password attempt against the stored hash
+        return ph.verify(argon2_encoded, attempt_input)
+    except argon2_exceptions.VerifyMismatchError:
+        # If the password attempt does not match, return False
+        return False
+    except argon2_exceptions.VerificationError:
+        # If there is an error in verification, return False
+        return False
 
 def init_db():
     # connect to vault.db
@@ -21,14 +92,12 @@ def init_db():
     cursor.execute("""
                    CREATE TABLE IF NOT EXISTS users(
                         username TEXT PRIMARY KEY,
-                        salt BLOB NOT NULL,
-                        pw_hash BLOB NOT NULL,
+                        pw_hash TEXT NOT NULL,
                         created_at INTEGER NOT NULL 
                 );
     """)
     # save changes to disk
     conn.commit() 
-
     return conn
 
 def user_exists(cursor: sqlite3.Cursor, username: str) -> bool:
@@ -36,24 +105,19 @@ def user_exists(cursor: sqlite3.Cursor, username: str) -> bool:
     cursor.execute("SELECT 1 FROM users WHERE username = ?;", (username,))
     return cursor.fetchone() is not None
 
-def store_new_user(cursor: sqlite3.Cursor, username: str, user_salt: bytes, pw_hash: bytes):
+def store_new_user(cursor: sqlite3.Cursor, username: str, pw_hash_text: bytes):
     """Store a new user and their details in the database"""
     created_at = int(time.time())
-    cursor.execute("INSERT INTO users (username, salt, pw_hash, created_at) VALUES (?, ?, ?, ?);",
-                   (username, user_salt, pw_hash, created_at)
+    cursor.execute("INSERT INTO users (username, pw_hash, created_at) VALUES (?, ?, ?);",
+                   (username, pw_hash_text, created_at)
     )
 
-def fetch_user_records(cursor: sqlite3.Cursor, username: str): 
+def fetch_user_hash(cursor: sqlite3.Cursor, username: str): 
     """Fetch user records from the database by username"""
-    cursor.execute("SELECT salt, pw_hash FROM users WHERE username = ?;", (username,)
+    cursor.execute("SELECT pw_hash FROM users WHERE username = ?;", (username,)
     )
-    return cursor.fetchone() 
-
-def derive_user_hash(password: str, user_salt: bytes) -> bytes:
-    """Derive a 32-byte PBKDF2-HMAC-SHA256 key from the password and salt"""
-    """Uses 200,000 iterations to slow down brute-force attacks"""
-    """Returns raw 32-byte hash, not hex"""
-    return hashlib.pbkdf2_hmac('sha256', password.encode("utf-8"), user_salt, 200000, dklen=32)
+    row = cursor.fetchone()
+    return row[0] if row else None 
 
 def password_strength(password: str) -> bool:
     """Check the strength of a password."""
@@ -82,72 +146,72 @@ def password_strength(password: str) -> bool:
 def create_account(conn: sqlite3.Connection):
     cursor = conn.cursor()
 
-    # (1) Ensure unique username
+    # 1) Ensure username is unique
     while True:
-        username = input("Please enter your username: ").strip()
+        username = input("Enter a username: ").strip()
         if user_exists(cursor, username):
-            print("Username already exists. Please choose a different one.")
+            print("Username already exists. Choose another.\n")
         else:
             break
-    # (2) Generate or manual password entry
+
+    # 2) Choose auto-generate vs manual
     choice = input("Generate a strong password for me? (Y/N): ").strip().lower()
-    # (2a) Auto generate strong password for user
     if choice == 'y' or choice == 'yes':
         while True:
-            generated_pwd = password_generator.generate_password(length=12, use_uppercase=True, use_numbers=True, use_special_chars=True)
-            print(f"Your generated password is: \n\n {generated_pwd}\n")
-            print("This will remain visible for 5 seconds, please copy or note it down.")
+            generated_pw = password_generator.generate_password()
+            print(f"\n Your generated password is:\n\n    {generated_pw}\n")
+            print(" (Visible for 5 seconds—copy or note it now.)")
             time.sleep(5)
-            print("\n" * 30) # Clear the screen
-            password = generated_pwd
+            print("\n" * 30)  # Clear screen
+
+            # Assume user accepts it (or you could ask Y/N here)
+            password = generated_pw
             break
-    else: 
-        # (2b) Manual password entry by user
+    else:
+        # 2b) Manual entry + confirm + complexity check
         while True:
-            password = getpass.getpass("Please enter your password: ")
-            retype_password = getpass.getpass("Please re-enter your password: ")
-            if password != retype_password:
-                print("Passwords do not match. Please try again.")
+            password = getpass.getpass("Enter a password: ")
+            confirm = getpass.getpass("Retype the password: ")
+            if password != confirm:
+                print(" • Passwords do not match. Try again.\n")
                 continue
-
             if not password_strength(password):
-                print("Password does not meet the strength requirements. Please try again.")
+                print(" • Please choose a stronger password.\n")
                 continue
-
             break
-    
-    # (3) Generate the salt and hash
-    user_salt = os.urandom(16)  # Generate a random 16-byte salt
-    pw_hash = derive_user_hash(password, user_salt)
-    password = None # Clear the password from memory
 
-    # (4) Insert user entry into DB and commit changes
-    store_new_user(cursor, username, user_salt, pw_hash)
+    # 3) Argon2id + pepper hashing
+    pw_hash_text = hash_password_with_argon2(password)
+
+    # Overwrite plaintext password in memory (optional good practice)
+    password = None
+
+    # 4) Insert into DB and commit
+    store_new_user(cursor, username, pw_hash_text)
     conn.commit()
-    print("Account created successfully.\n")
+    print("✅ Account created successfully.\n")
+
 
 def login(conn: sqlite3.Connection) -> bool:
     cursor = conn.cursor()
     username = input("Please enter your username: ")
 
     # Fetch the salt and pw from DB
-    record = fetch_user_records(cursor, username)
-    if record is None:
+    stored_pw_hash = fetch_user_hash(cursor, username)
+    if stored_pw_hash is None:
         print("No user found with that username.")
         return False
     
-    user_salt, stored_hash = record
-    
     # Get the password from the user, derive and compare the hash
     pw_try = getpass.getpass("Please enter your password: ")
-    derived_try = derive_user_hash(pw_try, user_salt)
+    success = verify_password_with_argon2(stored_pw_hash, pw_try)
     pw_try = None  # Clear the password from memory
 
-    if derived_try == stored_hash:
-        print("✅ Login Successful!\n")
+    if success:
+        print("✅ Login successful.\n")
         return True
     else:
-        print("❌ Invalid Password!\n")
+        print(" ❌ Invalid password.\n")
         return False
 
 def main():
@@ -176,17 +240,3 @@ def main():
      
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
