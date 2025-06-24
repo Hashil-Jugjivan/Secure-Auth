@@ -1,13 +1,15 @@
 from dotenv import load_dotenv
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
+import os
+import sys
 import sqlite3
 import string
 import time
-import hashlib
 import getpass
 import password_generator
-import os
-import sys
+import random 
+import smtplib
+from email.message import EmailMessage
 
  # Load environment variables from .env file
 load_dotenv() 
@@ -21,6 +23,51 @@ ph = PasswordHasher(
     parallelism=8,  # Number of threads
 )
 
+
+def init_db():
+    # connect to vault.db
+    conn = sqlite3.connect(DB_PATH)
+
+    # use a cursor to execute SQL commands
+    cursor = conn.cursor()
+
+    #create users table if it doesnt exist
+    cursor.execute("""
+                   CREATE TABLE IF NOT EXISTS users(
+                        username TEXT PRIMARY KEY,
+                        pw_hash TEXT NOT NULL,
+                        email TEXT UNIQUE, -- no duplicate emails allowed
+                        created_at INTEGER NOT NULL 
+                );
+    """)
+    # save changes to disk
+    conn.commit() 
+
+    # Check if the 'email' column already exists 
+    # If not add it
+    try:
+        cursor.execute("PRAGMA table_info(users);")
+        columns = [row[1] for row in cursor.fetchall()] # row[1] is the column name
+        if "email" not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN email TEXT UNIQUE;")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Create the OTPs table if it doesnt exist
+    cursor.execute("""
+                   CREATE TABLE IF NOT EXISTS otps(
+                        username TEXT NOT NULL,
+                        otp_code TEXT NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        PRIMARY KEY(username), -- only one OTP per user at a time
+                        FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+                   );
+    """)
+    conn.commit()
+
+    return conn
+
 def get_pepper() -> bytes:
     """Retrieve the pepper from environment variables."""
     pepper_hex = os.environ.get("PASSWORD_MANAGER_PEPPER")
@@ -32,6 +79,81 @@ def get_pepper() -> bytes:
     except ValueError:
         print("ERROR: PASSWORD_MANAGER_PEPPER must be a valid 64-character hex string.")
         exit(1)
+
+def generate_otp(length: int = 6) -> str:
+    """Generate a random numeric OTP of specified length."""
+    otp = random.randint(0, 10**length - 1)
+    return str(otp).zfill(length) # Pad with leading zeros if necessary
+
+def store_otp(cursor: sqlite3.Cursor, username: str, otp_code: str, validity_seconds: int = 180):
+    """ Insert or replace an row in the otps table for specific user
+        The OTP will expire after validity_seconds seconds"""
+    
+    expires_at = int(time.time()) + validity_seconds
+
+    # Insert or replace the OTP for the user
+    cursor.execute(
+        "INSERT OR REPLACE INTO otps(username, otp_code, expires_at) VALUES(?, ?, ?)",
+        (username, otp_code, expires_at)
+    )
+
+def send_otp_via_email(recipient_email: str, otp_code: str):
+    """ Send an email containing the OTP code to the receipient email"""
+
+    # Load SMTP settings from environment variables
+    host = os.environ.get("SMTP_HOST")
+    port = int(os.environ.get("SMTP_PORT", 587))  # Default to 587 if not set
+    user = os.environ.get("SMTP_USER")
+    passwd = os.environ.get("SMTP_PASSWORD")
+
+    if not all([host, port, user, passwd]):
+        print("ERROR: SMTP configuration is not fully set in .env")
+        sys.exit(1)
+
+    # Build the email message
+    msg = EmailMessage()
+    msg['Subject'] = 'Your password manager OTP Code'
+    msg['From'] = user
+    msg['To'] = recipient_email
+    msg.set_content(f"Your OTP code is: {otp_code}\n\nThis code is valid for 3 minutes.")
+
+    # Connect to the SMTP server and send the email
+    try:
+        with smtplib.SMTP(host, port) as server:
+            server.starttls() # Upgrade to secure connection (TLS)
+            server.login(user, passwd) # Log in with SMTP credentials
+            server.send_message(msg)
+        print(f"✅ OTP sent to {recipient_email}")
+    except Exception as e:
+        print(f"❌ Failed to send OTP email: {e}")
+        sys.exit(1)
+
+def verify_otp(cursor: sqlite3.Cursor, username: str, otp_attempt: str) -> bool:
+    """ Fetch the stored otp_code and expire_at from otp and verify the attempt"""
+
+    # Fetch the OTP code and expiration time for the user
+    cursor.execute("SELECT otp_code, expires_at FROM otps WHERE username = ?;", (username,))
+    row = cursor.fetchone()
+    if not row:
+        return False # No OTP found for this user
+    
+    # Unpack the row to get the variables
+    stored_otp_code, expires_at = row
+    now_timestamp = int(time.time())
+
+    # Check if the OTP has expired
+    if now_timestamp > expires_at:
+        # otp has expired, clean it up
+        cursor.execute("DELETE FROM otps WHERE username = ?;", (username,))
+        return False 
+    
+    # Check if the OTP attempt matches the stored OTP code
+    if otp_attempt == stored_otp_code:
+        # OTP is correct, remove it so it cannot be reused
+        cursor.execute("DELETE FROM otps WHERE username = ?;", (username,))
+        return True
+    
+    return False # OTP attempt did not match the stored OTP code
 
 def hash_password_with_argon2(plain_password: str) -> str:
     """Hash a password string using a salt, pepper, and Argon2"""
@@ -81,35 +203,16 @@ def verify_password_with_argon2(stored_pw_hash: str, password_attempt: str) -> b
         # If there is an error in verification, return False
         return False
 
-def init_db():
-    # connect to vault.db
-    conn = sqlite3.connect(DB_PATH)
-
-    # use a cursor to execute SQL commands
-    cursor = conn.cursor()
-
-    #create users table if it doesnt exist
-    cursor.execute("""
-                   CREATE TABLE IF NOT EXISTS users(
-                        username TEXT PRIMARY KEY,
-                        pw_hash TEXT NOT NULL,
-                        created_at INTEGER NOT NULL 
-                );
-    """)
-    # save changes to disk
-    conn.commit() 
-    return conn
-
 def user_exists(cursor: sqlite3.Cursor, username: str) -> bool:
     """Check if a user already exists in the database"""
     cursor.execute("SELECT 1 FROM users WHERE username = ?;", (username,))
     return cursor.fetchone() is not None
 
-def store_new_user(cursor: sqlite3.Cursor, username: str, pw_hash_text: bytes):
+def store_new_user(cursor: sqlite3.Cursor, username: str, pw_hash_text: str, email: str):
     """Store a new user and their details in the database"""
     created_at = int(time.time())
-    cursor.execute("INSERT INTO users (username, pw_hash, created_at) VALUES (?, ?, ?);",
-                   (username, pw_hash_text, created_at)
+    cursor.execute("INSERT INTO users (username, pw_hash, email, created_at) VALUES (?, ?, ?, ?);",
+                   (username, pw_hash_text, email, created_at)
     )
 
 def fetch_user_hash(cursor: sqlite3.Cursor, username: str): 
@@ -180,17 +283,50 @@ def create_account(conn: sqlite3.Connection):
                 continue
             break
 
-    # 3) Argon2id + pepper hashing
+    # 3) Email address collection and OTP verification
+    while True:
+        email = input("Please enter your email address: ").strip()
+    
+        # Email format check
+        if "@" not in email or "." not in email:
+            print("Invalid email format. Please try again.\n")
+            continue
+
+        # Check if another user already registered with this email
+        cursor.execute("SELECT 1 FROM users WHERE email = ?;", (email,))
+        if cursor.fetchone():
+            print("That email is already in use. Please use a different email.\n")
+            continue
+
+        # Generate a 6 digit OTP and store it in the database
+        otp_code = generate_otp(6)
+        store_otp(cursor, username, otp_code, validity_seconds=180)  # 3 minutes validity
+        conn.commit()
+
+        # Send the OTP via email
+        print(f"An OTP has been sent to {email}. Please check your inbox.")
+        send_otp_via_email(email, otp_code)
+
+        # Primpt user to enter the OTP and verify it
+        otp_attempt = input("Please enter the OTP sent to your email: ").strip()
+        if verify_otp(cursor, username, otp_attempt):
+            print("✅ Email verified successfully.\n")
+            conn.commit()
+            break
+        else:
+            print(" ❌ Invalid or expired OTP. Please try again.\n")
+            # Loop back to re-enter email and generate a new OTP
+
+    # 4) Argon2id + pepper hashing
     pw_hash_text = hash_password_with_argon2(password)
 
     # Overwrite plaintext password in memory (optional good practice)
     password = None
 
-    # 4) Insert into DB and commit
-    store_new_user(cursor, username, pw_hash_text)
+    # 5) Insert into DB and commit
+    store_new_user(cursor, username, pw_hash_text, email)
     conn.commit()
     print("✅ Account created successfully.\n")
-
 
 def login(conn: sqlite3.Connection) -> bool:
     cursor = conn.cursor()
@@ -204,14 +340,37 @@ def login(conn: sqlite3.Connection) -> bool:
     
     # Get the password from the user, derive and compare the hash
     pw_try = getpass.getpass("Please enter your password: ")
-    success = verify_password_with_argon2(stored_pw_hash, pw_try)
-    pw_try = None  # Clear the password from memory
+    if not verify_password_with_argon2(stored_pw_hash, pw_try):
+        print("❌ Incorrect password. Please try again.")
+        return False
+    
+    # overwrite plaintext password in memory
+    pw_try = None
 
-    if success:
-        print("✅ Login successful.\n")
+    # Retrive the email address for OTP
+    cursor.execute("SELECT email from users WHERE username = ?;", (username,))
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        print("ERROR: No email address associated with this account. Cannot send OTP.")
+        return False
+    user_email = row[0]
+
+    # Generate & send otp to users email for 2FA
+    otp_code = generate_otp(6)
+    store_otp(cursor, username, otp_code, validity_seconds=180)  # 3 minutes validity
+    conn.commit()
+
+    print(f"An OTP has been sent to {user_email}. Please check your inbox.")
+    send_otp_via_email(user_email, otp_code)
+
+    # Prompt user to enter the OTP and verify it
+    otp_attempt = input("Please enter the 6 digit OTP sent to your email: ").strip()
+    if verify_otp(cursor, username, otp_attempt):
+        conn.commit()
+        print("✅ Login successful. Welcome back!")
         return True
     else:
-        print(" ❌ Invalid password.\n")
+        print(" ❌ Invalid or expired OTP. Please try again.")
         return False
 
 def main():
@@ -240,3 +399,5 @@ def main():
      
 if __name__ == "__main__":
     main()
+
+#dhvv sqff kgec uqlv 
