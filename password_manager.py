@@ -512,24 +512,37 @@ def main():
         return
     
     while True:
-        print("Welcome to the Password Manager")
+        print("\n Welcome to the Password Manager")
         print("1. Create Account")
         print("2. Login")
-        print("3. Exit")
-        choice = input("Please choose an option (1-3): ")
+        print("3. View Audit Log (Admin Only)")
+        print("4. Exit")
 
-        if choice == '1':
+        choice = input("Please choose an option (1-4): ")
+
+        if choice == "1":
             create_account(conn)
-        elif choice == '2':
+        elif choice == "2":
             login(conn)
-        elif choice == '3':
-            conn.close()
-            print("Exiting the Password Manager. Goodbye!")
-            break
+        elif choice == "3":
+            admin_pw = getpass.getpass("Enter admin password to access audit log: ")
+            admin_hash = os.environ.get("ADMIN_PASSWORD_HASH")
+
+            ph = PasswordHasher()
+
+            try:
+                ph.verify(admin_hash, admin_pw)
+                view_audit_log(conn)
+            except (argon2_exceptions.VerifyMismatchError, TypeError):
+                print("❌ Access denied. Invalid admin password.")
+        elif choice == "4":
+                print("Goodbye!")
+                break
         else:
-            print("Invalid Choice. Please try again.")
+            print("Invalid option. Please try again.")
+
      
 if __name__ == "__main__":
     main()
 
-#dhvv sqff kgec uqlv 
+ 
