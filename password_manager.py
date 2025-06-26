@@ -80,7 +80,38 @@ def init_db():
     """)
     conn.commit()
 
+    # Create audit log table to track security-sensitive actions
+    cursor.execute("""
+                   CREATE TABLE IF NOT EXISTS audit_log(
+                        id INTEGER PRIMARy KEY AUTOINCREMENT,
+                        timestamp INTEGER NOT NULL,
+                        username TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        details TEXT,
+                        FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+                   );
+    """)
+    conn.commit()
+                    
     return conn
+
+def log_audit_event(cursor: sqlite3.Cursor, username: str, action: str, details: str = ""):
+    """ Record a security-sensitive action in the audit log """
+    timestamp = int(time.time())
+    cursor.execute("INSERT INTO audit_log (timestamp, username, action, details) VALUES (?, ?, ?, ?);"
+                   , (timestamp, username, action, details))
+    cursor.connection.commit()  # Commit the changes to the database
+    print(f"Audit log entry created for action: {action} by user: {username}")
+
+def view_audit_log(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    cursor.execute("SELECT timestamp, username, action, details FROM audit_log ORDER BY timestamp DESC;")
+    rows = cursor.fetchall()
+
+    print("\n📋 Audit Log:")
+    for ts, user, action, detail in rows:
+        readable_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
+        print(f"[{readable_time}] {user or 'N/A'} - {action}: {detail}")
 
 def get_pepper() -> bytes:
     """Retrieve the pepper from environment variables."""
@@ -407,6 +438,7 @@ def login(conn: sqlite3.Connection) -> bool:
     if is_locked:
         mins = seconds_remaining // 60
         secs = seconds_remaining % 60
+        log_audit_event(cursor, username, "account_locked", f"Too many failed attempts in {LOCKOUT_SECONDS}s")
         print(f"🚫 Account locked due to too many failed attempts.")
         print(f"   Please try again in {mins} minutes {secs} seconds.")
         return False
@@ -424,6 +456,7 @@ def login(conn: sqlite3.Connection) -> bool:
         print("❌ Incorrect password. Please try again.")
         # Record the failed login attempt
         record_login_attempt(cursor, username, success=False)
+        log_audit_event(cursor, username, "login_failed", "Invalid password")
         conn.commit()
         
         # Show remaining attempts
@@ -462,11 +495,13 @@ def login(conn: sqlite3.Connection) -> bool:
     # Prompt user to enter the OTP and verify it
     otp_attempt = input("Please enter the 6 digit OTP sent to your email: ").strip()
     if verify_otp(cursor, username, otp_attempt):
+        log_audit_event(cursor, username, "login_success", "MFA verified") # Log successful login
         clear_failed_login_attempts(cursor, username)  # Clear previous failed attempts
         conn.commit()
         print("✅ Login successful. Welcome back!")
         return True
     else:
+        log_audit_event(cursor, username, "otp_failed", "Incorrect OTP entered") # Log failed OTP attempt
         print(" ❌ Invalid or expired OTP. Please try again.")
         return False
 
