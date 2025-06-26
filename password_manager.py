@@ -23,6 +23,9 @@ ph = PasswordHasher(
     parallelism=8,  # Number of threads
 )
 
+# Constants for login attempts and lockout
+MAX_ATTEMPTS = 3  # Max failed login attempts before lockout
+LOCKOUT_SECONDS = 600  # Lockout period in seconds (10 minutes)
 
 def init_db():
     # connect to vault.db
@@ -62,6 +65,17 @@ def init_db():
                         expires_at INTEGER NOT NULL,
                         PRIMARY KEY(username), -- only one OTP per user at a time
                         FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+                   );
+    """)
+    conn.commit()
+
+    # Create login_attempts table to track failed login attempts
+    cursor.execute("""
+                   CREATE TABLE IF NOT EXISTS login_attempts(
+                    username TEXT NOT NULL,
+                    attempt_time INTEGER NOT NULL,
+                    success INTEGER CHECK(success IN (0, 1)), -- 0 for failed, 1 for successful
+                    FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
                    );
     """)
     conn.commit()
@@ -129,7 +143,7 @@ def send_otp_via_email(recipient_email: str, otp_code: str):
         sys.exit(1)
 
 def verify_otp(cursor: sqlite3.Cursor, username: str, otp_attempt: str) -> bool:
-    """ Fetch the stored otp_code and expire_at from otp and verify the attempt"""
+    """ Fetch the stored otp_code and expire_at from otp and verify the attempt """
 
     # Fetch the OTP code and expiration time for the user
     cursor.execute("SELECT otp_code, expires_at FROM otps WHERE username = ?;", (username,))
@@ -156,7 +170,7 @@ def verify_otp(cursor: sqlite3.Cursor, username: str, otp_attempt: str) -> bool:
     return False # OTP attempt did not match the stored OTP code
 
 def hash_password_with_argon2(plain_password: str) -> str:
-    """Hash a password string using a salt, pepper, and Argon2"""
+    """ Hash a password string using a salt, pepper, and Argon2 """
     # Create per user salt
     user_salt = os.urandom(16)
     salt_hex = user_salt.hex()
@@ -202,7 +216,61 @@ def verify_password_with_argon2(stored_pw_hash: str, password_attempt: str) -> b
     except argon2_exceptions.VerificationError:
         # If there is an error in verification, return False
         return False
+    
+def record_login_attempt(cursor: sqlite3.Cursor, username: str, success: bool):
+    """ Record a login attempt in the database """
+    
+    now = int(time.time())
+    cursor.execute("INSERT INTO login_attempts (username, attempt_time, success) VALUES (?, ?, ?);",
+                   (username, now, int(success))
+    )
 
+def check_account_lock_status(cursor: sqlite3.Cursor, username: str, max_attempts: int = 5, lockout_window_sec: int = 600) -> tuple[bool, int]:
+    """
+    Check if the account is locked due to too many failed login attempts.
+    Returns a tuple (is_locked: bool, seconds_remaining: int).
+    - is_locked: True if the account is locked, False otherwise.
+    - seconds_remaining: If locked, the number of seconds until the lockout expires, otherwise 0.
+    """
+
+    now = int(time.time())
+    window_start = now - lockout_window_sec
+
+    # Count failed attempts in window
+    cursor.execute("""
+        SELECT attempt_time FROM login_attempts
+        WHERE username = ? AND success = 0 AND attempt_time >= ?
+        ORDER BY attempt_time ASC;
+    """, (username, window_start))
+    failed_attempts = cursor.fetchall()
+
+    if len(failed_attempts) >= max_attempts:
+        # First failed attempt that triggered lockout
+        oldest_attempt = failed_attempts[0][0]
+        unlock_time = oldest_attempt + lockout_window_sec
+        seconds_remaining = max(0, unlock_time - now)
+        return (True, seconds_remaining)
+
+    return (False, 0)
+
+def count_failed_attempts(cursor: sqlite3.Cursor, username: str, window_sec: int = LOCKOUT_SECONDS) -> int:
+    """ Count the number of failed login attempts for a user within a specified time window """
+    
+    start_window = int(time.time()) - window_sec
+    cursor.execute("""
+        SELECT COUNT(*) FROM login_attempts
+        WHERE username = ? AND success = 0 AND attempt_time >= ?;
+        """, (username, start_window))
+    
+    return cursor.fetchone()[0]
+
+def clear_failed_login_attempts(cursor: sqlite3.Cursor, username: str):
+    """ Clear failed login attempts for a user after a successful login """
+    cursor.execute("""
+            DELETE FROM login_attempts
+            WHERE username = ? AND success = 0;
+            """, (username, ))
+ 
 def user_exists(cursor: sqlite3.Cursor, username: str) -> bool:
     """Check if a user already exists in the database"""
     cursor.execute("SELECT 1 FROM users WHERE username = ?;", (username,))
@@ -332,6 +400,17 @@ def login(conn: sqlite3.Connection) -> bool:
     cursor = conn.cursor()
     username = input("Please enter your username: ")
 
+    # Check if the account is locked due to too many failed attempts (Rate limiting)
+    is_locked, seconds_remaining = check_account_lock_status(cursor, username, MAX_ATTEMPTS, LOCKOUT_SECONDS)
+
+
+    if is_locked:
+        mins = seconds_remaining // 60
+        secs = seconds_remaining % 60
+        print(f"🚫 Account locked due to too many failed attempts.")
+        print(f"   Please try again in {mins} minutes {secs} seconds.")
+        return False
+
     # Fetch the salt and pw from DB
     stored_pw_hash = fetch_user_hash(cursor, username)
     if stored_pw_hash is None:
@@ -340,9 +419,26 @@ def login(conn: sqlite3.Connection) -> bool:
     
     # Get the password from the user, derive and compare the hash
     pw_try = getpass.getpass("Please enter your password: ")
+
     if not verify_password_with_argon2(stored_pw_hash, pw_try):
         print("❌ Incorrect password. Please try again.")
+        # Record the failed login attempt
+        record_login_attempt(cursor, username, success=False)
+        conn.commit()
+        
+        # Show remaining attempts
+        recent_fails = count_failed_attempts(cursor, username, LOCKOUT_SECONDS)
+        remaining_attempts = MAX_ATTEMPTS - recent_fails
+        if remaining_attempts > 0:
+            print(f"⚠️  You have {remaining_attempts} login attempt(s) remaining before account lockout.")
+        else:
+            print("🚫 Too many failed attempts. Your account is now temporarily locked.")
+
         return False
+   
+    # Record the successful login attempt
+    record_login_attempt(cursor, username, success=True)
+    conn.commit()
     
     # overwrite plaintext password in memory
     pw_try = None
@@ -366,6 +462,7 @@ def login(conn: sqlite3.Connection) -> bool:
     # Prompt user to enter the OTP and verify it
     otp_attempt = input("Please enter the 6 digit OTP sent to your email: ").strip()
     if verify_otp(cursor, username, otp_attempt):
+        clear_failed_login_attempts(cursor, username)  # Clear previous failed attempts
         conn.commit()
         print("✅ Login successful. Welcome back!")
         return True
