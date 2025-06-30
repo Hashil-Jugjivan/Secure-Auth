@@ -101,7 +101,7 @@ def log_audit_event(cursor: sqlite3.Cursor, username: str, action: str, details:
     cursor.execute("INSERT INTO audit_log (timestamp, username, action, details) VALUES (?, ?, ?, ?);"
                    , (timestamp, username, action, details))
     cursor.connection.commit()  # Commit the changes to the database
-    print(f"Audit log entry created for action: {action} by user: {username}")
+    #print(f"Audit log entry created for action: {action} by user: {username}")
 
 def view_audit_log(conn: sqlite3.Connection):
     cursor = conn.cursor()
@@ -505,6 +505,62 @@ def login(conn: sqlite3.Connection) -> bool:
         print(" ❌ Invalid or expired OTP. Please try again.")
         return False
 
+def change_password(conn: sqlite3.Connection):
+    """ Change or reset the user's password using OTP verification """
+    cursor = conn.cursor()
+    email = input("Enter your email address: ").strip()
+
+    # Check if email exists
+    cursor.execute("SELECT username FROM users WHERE email = ?", (email,))
+    result = cursor.fetchone()
+    if not result:
+        print("❌ No account found with that email.")
+        log_audit_event(cursor, None, "password_reset_failed", f"Email not found: {email}")
+        conn.commit()
+        return
+
+    username = result[0] # Get the username associated with the email
+
+    # Generate and send OTP
+    otp = generate_otp(6)
+    store_otp(cursor, username, otp, validity_seconds=300)
+    send_otp_via_email(email, otp)
+    conn.commit()
+
+    print("📨 An OTP has been sent to your email. Please enter it to proceed.")
+
+    user_otp = input("Enter the OTP: ").strip()
+
+    # Verify OTP using existing helper
+    if not verify_otp(cursor, username, user_otp):
+        print("❌ Incorrect or expired OTP. Password reset cancelled.")
+        log_audit_event(cursor, username, "password_reset_failed", "OTP verification failed")
+        conn.commit()
+        return
+
+    print("✅ OTP verified. Please enter a new password.")
+
+    # Prompt user until password is strong AND confirmed
+    while True:
+        new_pw = getpass.getpass("Enter new password: ")
+        if not password_strength(new_pw):
+            continue
+
+        confirm_pw = getpass.getpass("Re-enter new password: ")
+        if new_pw != confirm_pw:
+            print("❌ Passwords do not match. Please try again.")
+            continue
+
+        break  # Password is strong and confirmed
+
+    # Step 5: Hash and store new password securely
+    new_hash = hash_password_with_argon2(new_pw)
+    cursor.execute("UPDATE users SET pw_hash = ? WHERE username = ?", (new_hash, username))
+    conn.commit()
+
+    print("🔒 Password has been successfully updated.")
+    log_audit_event(cursor, username, "password_reset_success", "Password changed via email + OTP")
+
 def main():
     conn = init_db()
     if conn is None:
@@ -516,7 +572,8 @@ def main():
         print("1. Create Account")
         print("2. Login")
         print("3. View Audit Log (Admin Only)")
-        print("4. Exit")
+        print("4. Change/Reset Password")
+        print("5. Exit")
 
         choice = input("Please choose an option (1-4): ")
 
@@ -529,13 +586,20 @@ def main():
             admin_hash = os.environ.get("ADMIN_PASSWORD_HASH")
 
             ph = PasswordHasher()
+            cursor = conn.cursor()
 
             try:
                 ph.verify(admin_hash, admin_pw)
+                log_audit_event(cursor, "admin", "admin_login_success", "Viewed audit log") # log successful admin access
+                conn.commit()
                 view_audit_log(conn)
             except (argon2_exceptions.VerifyMismatchError, TypeError):
+                log_audit_event(cursor, "admin", "admin_login_failed", "Invalid admin password attempt") # log failed admin access
+                conn.commit()
                 print("❌ Access denied. Invalid admin password.")
         elif choice == "4":
+            change_password(conn)
+        elif choice == "5":
                 print("Goodbye!")
                 break
         else:
