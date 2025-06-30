@@ -95,7 +95,7 @@ Do **NOT** commit `.env` to GitHub.
 ### 🏃 Run the App
 
 ```bash
-python password_manager.py
+python secure_auth.py
 ```
 
 ### 🧪 Use Cases
@@ -114,7 +114,7 @@ python password_manager.py
 
 ```
 .
-├── password_manager.py      # Main CLI logic
+├── secure_auth.py      # Main CLI logic
 ├── password_generator.py    # (Optional) Strong password generator
 ├── vault.db                 # SQLite DB with secure schema
 ├── .env                     # Secrets and configuration (ignored by Git)
