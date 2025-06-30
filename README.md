@@ -1,4 +1,4 @@
-# 🔐 Secure Password Manager (Python CLI)
+# 🔐 SecureAuth: A Cybersecurity-Focused Python Login System
 
 A command-line password manager built in Python, designed with **cybersecurity best practices** to protect user credentials and simulate real-world secure login systems.
 
